@@ -64,7 +64,7 @@ server: uvicorn
 content-length: 109
 content-type: application/json
 
-{"id":1,"title":"Buy milk","description":null,"completed":false,"created_at":"...","updated_at":"..."}
+{"id":4,"title":"Buy milk","description":null,"completed":false,"created_at":"...","updated_at":"..."}
 ```
 
 ```
@@ -104,3 +104,5 @@ pytest -v
 ```
 
 13 tests: root endpoint, health check, full CRUD flow, missing/empty title (400), not-found errors (404), correct status codes on every endpoint.
+
+
