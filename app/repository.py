@@ -43,6 +43,11 @@ class TaskRepository:
     def __init__(self):
         self._tasks: Dict[int, Task] = {}
         self._id_counter = count(start=1)
+        self._seed()
+
+    def _seed(self):
+        for title in ["Buy groceries", "Finish report", "Review PR"]:
+            self.create(TaskCreate(title=title))
 
     def create(self, data: TaskCreate) -> Task:
         """Create a new task from the provided data and store it."""
