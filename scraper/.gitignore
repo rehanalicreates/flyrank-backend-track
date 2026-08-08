@@ -1,0 +1,6 @@
+# cache and output are generated artifacts
+cache/
+output/
+__pycache__/
+*.pyc
+.venv/
