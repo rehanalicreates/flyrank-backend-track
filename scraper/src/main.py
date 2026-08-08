@@ -1,14 +1,14 @@
 """
-Stage 2: discover the three catalogue pages and every book URL.
-
-Following the catalogue's own "next" links, collecting relative book links,
-turning them into absolute URLs, and removing duplicates. Cached pages cost no
-delay; real requests wait at least 500 ms (the fetch_page delay).
+Stage 1-3: fetch/cache, discover three catalogue pages + 60 book URLs,
+extract the eight raw fields per book from the cached detail pages.
 """
+import json
 import os
+import re
 import sys
 import time
-from urllib.parse import urljoin, urlparse
+from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -74,16 +74,73 @@ def book_links_from(html: str, page_url: str) -> list[str]:
     return links
 
 
+def cache_name_for(url: str) -> str:
+    m = re.search(r"/catalogue/[^/]*?([0-9]+)/index\.html", url)
+    book_id = m.group(1) if m else "book"
+    return f"detail-{book_id}.html"
+
+
+def extract_raw_record(html: str, url: str, source_page: str) -> dict:
+    """Pull the eight raw fields out of a book's detail page."""
+    soup = BeautifulSoup(html, "html.parser")
+    product = soup.select_one("article.product_page") or soup
+
+    title_el = product.select_one("h1")
+    title = title_el.get_text(strip=True) if title_el else None
+
+    price_el = product.select_one("p.price_color")
+    price_text = price_el.get_text(strip=True) if price_el else None
+
+    avail_el = product.select_one("p.availability")
+    availability_text = avail_el.get_text(strip=True) if avail_el else None
+
+    star_el = product.select_one("p.star-rating")
+    rating_text = None
+    if star_el and star_el.get("class"):
+        rating_text = star_el["class"][-1]
+
+    desc_el = product.select_one("div#product_description + p")
+    description = desc_el.get_text(strip=True) if desc_el else None
+
+    return {
+        "title": title,
+        "product_url": url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
 def main() -> None:  # noqa: C901
     pages = catalogue_pages(BASE_URL + "catalogue/page-1.html")
     print(f"catalogue_pages={len(pages)}")
 
-    all_links: list[str] = []
+    book_sources: dict[str, str] = {}
     for url, cache in pages:
         html, _ = fetch_page(url, cache)
-        all_links.extend(book_links_from(html, url))
+        for link in book_links_from(html, url):
+            book_sources.setdefault(link, url)
+    all_links = list(book_sources.keys())
     unique = sorted(set(all_links))
     print(f"discovered={len(all_links)}  unique_urls={len(unique)}")
+
+    raw_records = []
+    for i, book_url in enumerate(unique, 1):
+        html, from_cache = fetch_page(book_url, cache_name_for(book_url), delay=DELAY)
+        source_page = book_sources[book_url]
+        record = extract_raw_record(html, book_url, source_page)
+        raw_records.append(record)
+        if not from_cache:
+            print(f"  [{i:02d}] FETCH {book_url}")
+        else:
+            print(f"  [{i:02d}] cache {book_url}")
+
+    print(f"detail_pages={len(raw_records)}")
+    pretty = json.dumps(raw_records[0], indent=2, ensure_ascii=False)
+    print("sample raw record:\n" + pretty)
 
 
 if __name__ == "__main__":
