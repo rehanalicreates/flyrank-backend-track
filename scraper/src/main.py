@@ -1,7 +1,8 @@
 """
-Stage 1-4: fetch/cache, discover three catalogue pages + 60 book URLs,
+Stage 1-5: fetch/cache, discover three catalogue pages + 60 book URLs,
 extract the eight raw fields per book, normalize + validate with Pydantic,
-store unique records to output/books.json (idempotent across reruns).
+store unique records to output/books.json (idempotent across reruns),
+survive broken URLs and log everything to output/run-report.json.
 """
 import json
 import os
@@ -14,7 +15,7 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from pydantic import BaseModel, ValidationError
 
 BASE_URL = "https://books.toscrape.com/"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
@@ -26,9 +27,12 @@ USER_AGENT = (
 TIMEOUT = 10  # seconds; give up, never wait forever
 DELAY = 0.5   # seconds between real requests to the site
 
+RETRYABLE_STATUS = {500, 502, 503, 504}
+
 
 def fetch_page(url: str, cache_name: str, delay: float = 0.0) -> tuple[str, bool]:
-    """Return (html, from_cache). Downloads and caches on first use; reads cache after."""
+    """Return (html, from_cache). Downloads and caches on first use; reads cache after.
+    One retry on timeout / server error; never on 404 or 403."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_name)
 
@@ -39,7 +43,19 @@ def fetch_page(url: str, cache_name: str, delay: float = 0.0) -> tuple[str, bool
     if delay:
         time.sleep(delay)  # be a polite guest between real requests
 
-    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        # transient network failure: wait a moment and try once more
+        time.sleep(1.0)
+        try:
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        except requests.RequestException:
+            raise RuntimeError(f"fetch failed (retried): {url} -> {e}")
+
+    if resp.status_code in RETRYABLE_STATUS:
+        time.sleep(1.0)
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
     if resp.status_code != 200:
         raise RuntimeError(f"fetch failed: {url} -> HTTP {resp.status_code}")
 
@@ -143,13 +159,8 @@ def normalize_price(price_text: Optional[str]) -> Optional[float]:
     return float(m.group().replace(",", "")) if m else None
 
 
-def clean_record(raw: dict) -> dict:
-    """Turn a raw 8-field record into a finished one: numbers, identity, provenance."""
-    return {
-        **raw,
-        "price_gbp": normalize_price(raw.get("price_text")),
-        "product_url": raw["product_url"],
-    }
+def clean(raw: dict) -> dict:
+    return {**raw, "price_gbp": normalize_price(raw.get("price_text"))}
 
 
 def validate_records(raw_records: list[dict]) -> tuple[list[BookRecord], list[dict]]:
@@ -164,10 +175,6 @@ def validate_records(raw_records: list[dict]) -> tuple[list[BookRecord], list[di
                 "reason": "; ".join(err["msg"] for err in e.errors()),
             })
     return good, bad
-
-
-def clean(raw: dict) -> dict:
-    return {**raw, "price_gbp": normalize_price(raw.get("price_text"))}
 
 
 def write_outputs(good: list[BookRecord], bad: list[dict]) -> None:
@@ -192,7 +199,11 @@ def write_outputs(good: list[BookRecord], bad: list[dict]) -> None:
     print(f"output/books.json: {len(merged)} records  errors: {len(bad)}")
 
 
+FAILED_URLS: list[str] = []  # broken URLs to prove the run survives
+
+
 def main() -> None:  # noqa: C901
+    started = time.time()
     pages = catalogue_pages(BASE_URL + "catalogue/page-1.html")
     print(f"catalogue_pages={len(pages)}")
 
@@ -203,12 +214,20 @@ def main() -> None:  # noqa: C901
             book_sources.setdefault(link, url)
     all_links = list(book_sources.keys())
     unique = sorted(set(all_links))
+    if sys.argv[1:] == ["--test-broken-url"]:
+        unique.append("https://books.toscrape.com/catalogue/this-book-does-not-exist_99999/index.html")
     print(f"discovered={len(all_links)}  unique_urls={len(unique)}")
 
-    raw_records = []
+    raw_records: list[dict] = []
+    fetch_failures: list[dict] = []
     for i, book_url in enumerate(unique, 1):
-        html, from_cache = fetch_page(book_url, cache_name_for(book_url), delay=DELAY)
-        source_page = book_sources[book_url]
+        source_page = book_sources.get(book_url, "MANUAL_INJECTION")
+        try:
+            html, from_cache = fetch_page(book_url, cache_name_for(book_url), delay=DELAY)
+        except RuntimeError as e:
+            fetch_failures.append({"url": book_url, "reason": str(e)})
+            print(f"  [{i:02d}] FAIL {book_url} -> {e}")
+            continue
         record = extract_raw_record(html, book_url, source_page)
         raw_records.append(record)
         if not from_cache:
@@ -219,6 +238,24 @@ def main() -> None:  # noqa: C901
     print(f"detail_pages={len(raw_records)}")
     good, bad = validate_records(raw_records)
     write_outputs(good, bad)
+
+    report = {
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": round(time.time() - started, 1),
+        "pages_passed": len(pages),
+        "books_discovered": len(all_links),
+        "books_attempted": len(unique),
+        "books_succeeded": len(good),
+        "books_failed": len(fetch_failures),
+        "validation_errors": len(bad),
+        "failures": fetch_failures,
+    }
+    out_dir = os.path.join(os.path.dirname(CACHE_DIR), "output")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "run-report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(f"run-report.json: {report['books_succeeded']} ok, {report['books_failed']} failed, {report['validation_errors']} invalid")
+
     print("sample clean record:")
     print(json.dumps(good[0].model_dump(), indent=2, ensure_ascii=False))
 
