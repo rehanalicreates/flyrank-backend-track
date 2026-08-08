@@ -1,6 +1,7 @@
 """
-Stage 1-3: fetch/cache, discover three catalogue pages + 60 book URLs,
-extract the eight raw fields per book from the cached detail pages.
+Stage 1-4: fetch/cache, discover three catalogue pages + 60 book URLs,
+extract the eight raw fields per book, normalize + validate with Pydantic,
+store unique records to output/books.json (idempotent across reruns).
 """
 import json
 import os
@@ -8,10 +9,12 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
 BASE_URL = "https://books.toscrape.com/"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
@@ -114,6 +117,81 @@ def extract_raw_record(html: str, url: str, source_page: str) -> dict:
     }
 
 
+class BookRecord(BaseModel):
+    """The single schema every finished record must satisfy."""
+
+    title: str
+    product_url: str  # canonical identity of the record
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: Optional[str] = None
+    source_page: str
+    fetched_at: str
+    stock_count: Optional[int] = None
+
+
+_GBP_RE = re.compile(r"[\d,]+\.\d{2}")
+
+
+def normalize_price(price_text: Optional[str]) -> Optional[float]:
+    """'£51.77' -> 51.77. Returns None when nothing numeric is found."""
+    if not price_text:
+        return None
+    m = _GBP_RE.search(price_text)
+    return float(m.group().replace(",", "")) if m else None
+
+
+def clean_record(raw: dict) -> dict:
+    """Turn a raw 8-field record into a finished one: numbers, identity, provenance."""
+    return {
+        **raw,
+        "price_gbp": normalize_price(raw.get("price_text")),
+        "product_url": raw["product_url"],
+    }
+
+
+def validate_records(raw_records: list[dict]) -> tuple[list[BookRecord], list[dict]]:
+    """Validates every record; failures are set aside with the reason."""
+    good, bad = [], []
+    for raw in raw_records:
+        try:
+            good.append(BookRecord(**clean(raw)))
+        except ValidationError as e:
+            bad.append({
+                "record": raw,
+                "reason": "; ".join(err["msg"] for err in e.errors()),
+            })
+    return good, bad
+
+
+def clean(raw: dict) -> dict:
+    return {**raw, "price_gbp": normalize_price(raw.get("price_text"))}
+
+
+def write_outputs(good: list[BookRecord], bad: list[dict]) -> None:
+    out_dir = os.path.join(os.path.dirname(CACHE_DIR), "output")
+    os.makedirs(out_dir, exist_ok=True)
+    books_path = os.path.join(out_dir, "books.json")
+    errors_path = os.path.join(out_dir, "errors.json")
+
+    full = [r.model_dump() for r in good]
+    existing = {}
+    if os.path.isfile(books_path):
+        with open(books_path, "r", encoding="utf-8") as f:
+            existing = {r["product_url"]: r for r in json.load(f)}
+    merged = {r["product_url"]: r for r in full}
+    merged.update(existing)  # reruns update in place; never duplicate
+
+    with open(books_path, "w", encoding="utf-8") as f:
+        json.dump(list(merged.values()), f, indent=2, ensure_ascii=False)
+    with open(errors_path, "w", encoding="utf-8") as f:
+        json.dump(bad, f, indent=2, ensure_ascii=False)
+
+    print(f"output/books.json: {len(merged)} records  errors: {len(bad)}")
+
+
 def main() -> None:  # noqa: C901
     pages = catalogue_pages(BASE_URL + "catalogue/page-1.html")
     print(f"catalogue_pages={len(pages)}")
@@ -139,8 +217,10 @@ def main() -> None:  # noqa: C901
             print(f"  [{i:02d}] cache {book_url}")
 
     print(f"detail_pages={len(raw_records)}")
-    pretty = json.dumps(raw_records[0], indent=2, ensure_ascii=False)
-    print("sample raw record:\n" + pretty)
+    good, bad = validate_records(raw_records)
+    write_outputs(good, bad)
+    print("sample clean record:")
+    print(json.dumps(good[0].model_dump(), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
