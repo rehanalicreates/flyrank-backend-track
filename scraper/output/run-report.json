@@ -1,0 +1,16 @@
+{
+  "started_at": "2026-08-08T11:15:46Z",
+  "duration_seconds": 3.7,
+  "pages_passed": 3,
+  "books_discovered": 60,
+  "books_attempted": 61,
+  "books_succeeded": 60,
+  "books_failed": 1,
+  "validation_errors": 0,
+  "failures": [
+    {
+      "url": "https://books.toscrape.com/catalogue/this-book-does-not-exist_99999/index.html",
+      "reason": "fetch failed: https://books.toscrape.com/catalogue/this-book-does-not-exist_99999/index.html -> HTTP 404"
+    }
+  ]
+}

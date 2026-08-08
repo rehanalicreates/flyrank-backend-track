@@ -1,6 +1,5 @@
-# cache and output are generated artifacts
+# cache is a generated artifact; output/ is committed as deliverable evidence
 cache/
-output/
 __pycache__/
 *.pyc
 .venv/
