@@ -42,6 +42,24 @@ python src/main.py
 Output: `output/books.json`, `output/errors.json`, `output/run-report.json`.
 During development, requests are served from `cache/` — the site is asked once.
 
+### Prove it survives a broken page
+
+```sh
+python src/main.py --test-broken-url
+```
+
+The run injects one deliberately nonexistent URL, logs the 404 in `run-report.json`
+under `failures` (`books_failed: 1`), and every real book still gets scraped —
+`books.json` stays at 60 records. The same path covers timeouts and 5xx, which get
+one retry before being logged (404/403 are never retried).
+
+## A stranger's evidence
+
+Latest `output/run-report.json` (committed): `books_succeeded: 60`, `books_failed: 1`
+(only the injected fake URL), `validation_errors: 0`. Since all pages are cached,
+reruns finish in seconds and `books.json` never grows beyond the 60 unique books —
+each run is idempotent by `product_url`.
+
 ## Output schema
 
 | field | type | required | notes |
@@ -55,7 +73,7 @@ During development, requests are served from `cache/` — the site is asked once
 | `description` | str / null | no | null when the page has none |
 | `source_page` | str | yes | provenance: which catalogue page |
 | `fetched_at` | str | yes | ISO UTC timestamp, provenance |
-| `stock_count` | int / null | no | parsed from availability (informational) |
+| `stock_count` | int / null | no | parsed from availability, e.g. 22 |
 
 No browser is needed for this assignment: the data is already in the HTML the server
 sends, so a browser would only add cost.

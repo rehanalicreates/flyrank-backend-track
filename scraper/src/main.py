@@ -149,6 +149,7 @@ class BookRecord(BaseModel):
 
 
 _GBP_RE = re.compile(r"[\d,]+\.\d{2}")
+_STOCK_RE = re.compile(r"In stock \(([\d,]+) available\)")
 
 
 def normalize_price(price_text: Optional[str]) -> Optional[float]:
@@ -159,8 +160,20 @@ def normalize_price(price_text: Optional[str]) -> Optional[float]:
     return float(m.group().replace(",", "")) if m else None
 
 
+def normalize_stock(availability_text: Optional[str]) -> Optional[int]:
+    """'In stock (22 available)' -> 22. None when the text has no count."""
+    if not availability_text:
+        return None
+    m = _STOCK_RE.search(availability_text)
+    return int(m.group(1).replace(",", "")) if m else None
+
+
 def clean(raw: dict) -> dict:
-    return {**raw, "price_gbp": normalize_price(raw.get("price_text"))}
+    return {
+        **raw,
+        "price_gbp": normalize_price(raw.get("price_text")),
+        "stock_count": normalize_stock(raw.get("availability_text")),
+    }
 
 
 def validate_records(raw_records: list[dict]) -> tuple[list[BookRecord], list[dict]]:
@@ -188,8 +201,8 @@ def write_outputs(good: list[BookRecord], bad: list[dict]) -> None:
     if os.path.isfile(books_path):
         with open(books_path, "r", encoding="utf-8") as f:
             existing = {r["product_url"]: r for r in json.load(f)}
-    merged = {r["product_url"]: r for r in full}
-    merged.update(existing)  # reruns update in place; never duplicate
+    merged = dict(existing)
+    merged.update({r["product_url"]: r for r in full})  # new run wins; union stays idempotent
 
     with open(books_path, "w", encoding="utf-8") as f:
         json.dump(list(merged.values()), f, indent=2, ensure_ascii=False)
