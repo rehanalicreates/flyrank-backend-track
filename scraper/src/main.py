@@ -29,14 +29,19 @@ DELAY = 0.5   # seconds between real requests to the site
 
 RETRYABLE_STATUS = {500, 502, 503, 504}
 
+CACHE_HITS = 0
+LIVE_FETCHES = 0
+
 
 def fetch_page(url: str, cache_name: str, delay: float = 0.0) -> tuple[str, bool]:
     """Return (html, from_cache). Downloads and caches on first use; reads cache after.
     One retry on timeout / server error; never on 404 or 403."""
+    global CACHE_HITS, LIVE_FETCHES
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_path = os.path.join(CACHE_DIR, cache_name)
 
     if os.path.isfile(cache_path):
+        CACHE_HITS += 1
         with open(cache_path, "r", encoding="utf-8") as f:
             return f.read(), True
 
@@ -61,6 +66,7 @@ def fetch_page(url: str, cache_name: str, delay: float = 0.0) -> tuple[str, bool
 
     with open(cache_path, "w", encoding="utf-8") as f:
         f.write(resp.text)
+    LIVE_FETCHES += 1
     return resp.text, False
 
 
@@ -261,6 +267,8 @@ def main() -> None:  # noqa: C901
         "books_succeeded": len(good),
         "books_failed": len(fetch_failures),
         "validation_errors": len(bad),
+        "pages_fetched_live": LIVE_FETCHES,
+        "cache_hits": CACHE_HITS,
         "failures": fetch_failures,
     }
     out_dir = os.path.join(os.path.dirname(CACHE_DIR), "output")

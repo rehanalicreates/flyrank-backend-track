@@ -32,6 +32,15 @@ sandbox banner is the permission here, and the scope stays minimal either way.
 
 > **I will not reuse this code on another site without checking its rules and terms first.**
 
+**Ethics note (in my own words):** use an official API when one exists; never bypass logins, paywalls,
+or blocks; collect only what you need. This scraper touches nothing but the sandbox.
+
+## Honest limitation
+
+The cache is write-once by design: a page fetched today is served from `cache/` forever. If the site
+changes its markup, delete `cache/` and rerun. The scope is deliberately fixed to the first three
+catalogue pages — the pipeline does not follow beyond page 3 or paginate further.
+
 ## How to run
 
 ```sh
@@ -56,9 +65,11 @@ one retry before being logged (404/403 are never retried).
 ## A stranger's evidence
 
 Latest `output/run-report.json` (committed): `books_succeeded: 60`, `books_failed: 1`
-(only the injected fake URL), `validation_errors: 0`. Since all pages are cached,
-reruns finish in seconds and `books.json` never grows beyond the 60 unique books —
-each run is idempotent by `product_url`.
+(only the injected fake URL), `validation_errors: 0`, `cache_hits: 66` (3 discovery
+passes over the catalogue + 60 detail pages — the site was asked once, reruns read the
+cache; `pages_fetched_live: 0` on rerun). Since all pages are cached, reruns finish in
+seconds and `books.json` never grows beyond the 60 unique books — each run is
+idempotent by `product_url`.
 
 ## Output schema
 

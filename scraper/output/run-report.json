@@ -1,12 +1,14 @@
 {
-  "started_at": "2026-08-08T11:26:47Z",
-  "duration_seconds": 2.3,
+  "started_at": "2026-08-10T10:33:42Z",
+  "duration_seconds": 8.1,
   "pages_passed": 3,
   "books_discovered": 60,
   "books_attempted": 61,
   "books_succeeded": 60,
   "books_failed": 1,
   "validation_errors": 0,
+  "pages_fetched_live": 0,
+  "cache_hits": 66,
   "failures": [
     {
       "url": "https://books.toscrape.com/catalogue/this-book-does-not-exist_99999/index.html",
