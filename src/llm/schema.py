@@ -7,7 +7,7 @@ until it fits).
 """
 
 from enum import Enum
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,9 +22,14 @@ class TriageVerdict(str, Enum):
 
 
 class TriageRequest(BaseModel):
-    """What the API accepts. The message is required and must not be empty."""
+    """What the API accepts. The message is required and must not be empty.
+
+    idempotency_key is the BE-06 client-side dedupe: posting the same key
+    twice returns the SAME job instead of creating a second one.
+    """
 
     message: str = Field(..., min_length=1, max_length=2000)
+    idempotency_key: Optional[str] = Field(None, max_length=128)
 
 
 class TriageResult(BaseModel):
