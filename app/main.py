@@ -19,10 +19,17 @@ from fastapi import FastAPI, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.requests import Request
+from dotenv import load_dotenv
 
 from app.exceptions import TaskNotFoundError
 from app.models import TaskCreate, TaskUpdate, TaskResponse
 from app.repository import task_repository
+from src.llm.clients import LLMClient, LLMDisabled, LLMTimeout, LLMUnavailable
+from src.llm.schema import TriageRequest, TriageResult
+from src.llm.service import LLMInvalidOutput, triage_message
+from src.llm.settings import get_settings
+
+load_dotenv()
 
 app = FastAPI(
     title="FlyRank Task API",
@@ -61,9 +68,58 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
                 "message": "Title is required and must not be empty.",
             },
         )
+    message_errors = ("missing", "value_error", "string_too_short", "string_too_long")
+    has_message_error = any(
+        err.get("loc") == ("body", "message") and err.get("type") in message_errors
+        for err in exc.errors()
+    )
+    if has_message_error:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": "validation_error",
+                "message": "'message' is required and must be a non-empty string.",
+            },
+        )
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": exc.errors()},
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM error handling (A17)
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(LLMTimeout)
+async def llm_timeout_handler(request: Request, exc: LLMTimeout):
+    return JSONResponse(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        content={"error": "llm_timeout", "message": str(exc)},
+    )
+
+
+@app.exception_handler(LLMUnavailable)
+async def llm_unavailable_handler(request: Request, exc: LLMUnavailable):
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": "llm_unavailable", "message": str(exc)},
+    )
+
+
+@app.exception_handler(LLMDisabled)
+async def llm_disabled_handler(request: Request, exc: LLMDisabled):
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": "llm_disabled", "message": str(exc)},
+    )
+
+
+@app.exception_handler(LLMInvalidOutput)
+async def llm_invalid_output_handler(request: Request, exc: LLMInvalidOutput):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": "invalid_llm_output", "message": str(exc)},
     )
 
 
@@ -117,3 +173,21 @@ def delete_task(task_id: int) -> None:
     """Delete a task. Returns 204 (no body) on success, 404 if missing."""
     task_repository.delete(task_id)
     return None
+
+
+# ---------------------------------------------------------------------------
+# A17: LLM endpoint - triage candidate messages
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/jobs/triage",
+    response_model=TriageResult,
+    tags=["jobs"],
+)
+def triage_job_message(payload: TriageRequest) -> TriageResult:
+    """Put an LLM behind the API: classify a candidate message into one of
+    four closed categories. Returns 400 for bad input, 503 when the LLM is
+    disabled/unavailable, 504 on timeout, 422 when the LLM output does not
+    validate even after one repair."""
+    client = LLMClient(cfg=get_settings())
+    return triage_message(payload.message, client=client)
