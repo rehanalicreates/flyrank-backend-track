@@ -1,9 +1,9 @@
-"""A17 eval runner.
+"""A17/BE-06 eval runner.
 
-Sends every labeled case in cases.json to the real /jobs/triage endpoint
-(over HTTP through FastAPI's TestClient, so input validation and the full
-request path are exercised, not just the LLM call), then scores the verdicts
-against the labels.
+Submits every labeled case in cases.json as a background job (the same way a
+client would: POST -> 202 -> poll the status endpoint), then scores the
+verdicts against the labels. Since BE-06 the LLM call happens on the worker,
+so this exercise also proves the background pipeline end to end.
 
 Run from the repo root:
     python evals/run.py
@@ -15,6 +15,7 @@ the score line used in the README.
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,34 +26,50 @@ if str(ROOT) not in sys.path:
 CASES = json.loads((ROOT / "evals" / "cases.json").read_text(encoding="utf-8"))
 
 from fastapi.testclient import TestClient  # noqa: E402
-from app.main import app  # noqa: E402 (imports after env decisions are fine, settings are read per request)
+from app.main import app  # noqa: E402 (settings are read per request, so env order is fine)
 
-client = TestClient(app)
+PER_CASE_TIMEOUT = 90.0
+
+
+def submit_and_wait(client, message: str):
+    """POST (expect 202) then follow the status endpoint until done."""
+    resp = client.post("/jobs/triage", json={"message": message})
+    if resp.status_code != 202:
+        return None, {"http_status": resp.status_code, "body": resp.json()}
+    job_id = resp.json()["job_id"]
+    deadline = time.time() + PER_CASE_TIMEOUT
+    while True:
+        body = client.get(f"/jobs/triage/{job_id}").json()
+        if body["status"] == "succeeded":
+            return body["result"]["verdict"], body
+        if body["status"] == "failed":
+            return None, body
+        if time.time() > deadline:
+            raise TimeoutError(f"job {job_id} still {body['status']} after {PER_CASE_TIMEOUT}s")
+        time.sleep(0.25)
 
 
 def main() -> None:
-    results = []
-    correct = 0
+    with TestClient(app) as client:
+        results = []
+        correct = 0
 
-    for case in CASES:
-        resp = client.post("/jobs/triage", json={"message": case["message"]})
-        predicted = None
-        if resp.status_code == 200:
-            predicted = resp.json()["verdict"]
-        ok = predicted == case["expected"]
-        correct += 1 if ok else 0
-        results.append(
-            {
-                "id": case["id"],
-                "expected": case["expected"],
-                "predicted": predicted,
-                "http_status": resp.status_code,
-                "ok": ok,
-            }
-        )
-        flag = "PASS" if ok else "FAIL"
-        print(f"[{flag}] {case['id']:<14} expected={case['expected']:<10} "
-              f"predicted={predicted}")
+        for case in CASES:
+            predicted, body = submit_and_wait(client, case["message"])
+            ok = predicted == case["expected"]
+            correct += 1 if ok else 0
+            results.append(
+                {
+                    "id": case["id"],
+                    "expected": case["expected"],
+                    "predicted": predicted,
+                    "job_status": body.get("status"),
+                    "ok": ok,
+                }
+            )
+            flag = "PASS" if ok else "FAIL"
+            print(f"[{flag}] {case['id']:<14} expected={case['expected']:<10} "
+                  f"predicted={predicted}")
 
     total = len(CASES)
     score = correct / total
