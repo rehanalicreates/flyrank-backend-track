@@ -1,14 +1,18 @@
 # Task API with LLM triage
 
-Week 2 (BE-01, CRUD Task API) plus A17 (`Put an LLM behind your API`) for the
-**Backend AI Engineering** track at FlyRank.
+Week 2 (BE-01, CRUD Task API) plus A17 (`Put an LLM behind your API`) and
+BE-06 (`Your first background job`) for the **Backend AI Engineering** track
+at FlyRank.
 
-Two things live in this repo:
+Three things live in this repo:
 
 1. A CRUD API that manages a to-do list: create, read, update, delete tasks.
-2. An LLM-powered endpoint (`/jobs/triage`) that classifies a candidate
-   message into one of four closed categories, with clean error handling,
-   timeouts, retries, a stub mode, a kill switch, and a per-call cost log.
+2. An LLM-powered triage job (`/jobs/triage`): classifies a candidate message
+   into one of four closed categories, with clean error handling, timeouts,
+   retries, a stub mode, a kill switch, and a per-call cost log (A17).
+3. The same job executed as a **background job** (BE-06): `POST` answers 202
+   instantly, a worker pool does the LLM call, `GET /jobs/triage/{id}` reports
+   status and result. Idempotency, retries, and alerts are built in.
 
 ## Stack
 
@@ -16,7 +20,7 @@ Two things live in this repo:
 - **Pydantic v2** - request/response validation
 - **openai + python-dotenv** - LLM client glue; works with Ollama locally or
   any OpenAI-compatible provider
-- **pytest + httpx** - test suite (23 tests)
+- **pytest + httpx** - test suite (28 tests)
 
 ## Run it
 
@@ -31,16 +35,17 @@ Interactive docs (Swagger UI): http://127.0.0.1:8000/docs
 
 ## Endpoints
 
-| Method | Path             | Status codes                                          |
-|--------|------------------|-------------------------------------------------------|
-| GET    | `/`              | 200 - API metadata                                    |
-| GET    | `/health`        | 200 - liveness check                                  |
-| POST   | `/tasks`         | 201 Created, 400 Bad Request                          |
-| GET    | `/tasks`         | 200 OK                                                |
-| GET    | `/tasks/{id}`    | 200 OK, 404 Not Found                                 |
-| PUT    | `/tasks/{id}`    | 200 OK, 400 Bad Request, 404 Not Found                |
-| DELETE | `/tasks/{id}`    | 204 No Content, 404 Not Found                         |
-| POST   | `/jobs/triage`   | 200 OK, 400 Bad Request, 422 Unprocessable, 503/504 LLM errors |
+| Method | Path                   | Status codes                                          |
+|--------|------------------------|-------------------------------------------------------|
+| GET    | `/`                    | 200 - API metadata                                    |
+| GET    | `/health`              | 200 - liveness check                                  |
+| POST   | `/tasks`               | 201 Created, 400 Bad Request                          |
+| GET    | `/tasks`               | 200 OK                                                |
+| GET    | `/tasks/{id}`          | 200 OK, 404 Not Found                                 |
+| PUT    | `/tasks/{id}`          | 200 OK, 400 Bad Request, 404 Not Found                |
+| DELETE | `/tasks/{id}`          | 204 No Content, 404 Not Found                         |
+| POST   | `/jobs/triage`         | 202 Accepted, 400 Bad Request (LLM runs in background)|
+| GET    | `/jobs/triage/{id}`    | 200 OK, 404 Not Found                                 |
 
 ## curl example: create a task
 
@@ -51,18 +56,54 @@ HTTP/1.1 201 Created
 {"id":4,"title":"Buy milk","description":null,"completed":false,"created_at":"...","updated_at":"..."}
 ```
 
-## curl example: triage a candidate message (runnable)
+## curl example: triage a candidate message (runnable, BE-06 background flow)
+
+The endpoint answers instantly; the LLM call happens on a worker. Poll the
+status endpoint until the result is there:
 
 ```
-$ curl -X POST http://127.0.0.1:8000/jobs/triage \
+$ curl -i -X POST http://127.0.0.1:8000/jobs/triage \
     -H "Content-Type: application/json" \
     -d '{"message": "hi I am a product designer with 5 years of experience, I would like to apply for the open role"}'
 
-{"verdict":"interested","reasons":["Wants to apply for the role","Mentions the open role"]}
+HTTP/1.1 202 Accepted
+location: /jobs/triage/triage_29de8a4db36b
+
+{"job_id":"triage_29de8a4db36b","status":"queued","status_url":"/jobs/triage/triage_29de8a4db36b"}
 ```
+
+```
+$ curl http://127.0.0.1:8000/jobs/triage/triage_29de8a4db36b
+
+{"job_id":"triage_29de8a4db36b","idempotency_key":null,"status":"succeeded",
+ "attempts":1,"result":{"verdict":"interested","reasons":["Wants to apply for the role","Mentions the open role"]},
+ "error":null,"created_at":"...","updated_at":"..."}
+```
+
+Statuses: `queued` -> `running` -> `succeeded` (result present) or `failed`
+(error present).
 
 Windows cmd note: single quotes do not work in cmd; use
 `-d "{\"message\":\"...\"}"` there.
+
+## Idempotency (BE-06: "jobs will run twice")
+
+Two layers:
+
+1. **Client side** - resend the same `idempotency_key` and you get the SAME
+   job back, never a duplicate:
+
+```
+$ curl -i -X POST http://127.0.0.1:8000/jobs/triage -H "Content-Type: application/json" \
+    -d '{"message":"I want to apply","idempotency_key":"contact-form-42"}'
+HTTP/1.1 202 Accepted   (same job_id on every retry)
+```
+
+2. **Worker side** - the job is a pure function of its input message, so if a
+   restart replays an unfinished job (status left in queued/running), a re-run
+   produces the same verdict. Jobs in "succeeded"/"failed" are never executed
+   again, and duplicate queue tokens collapse onto one execution (in-flight
+   guard). The result is that running twice is safe and costs nothing extra.
 
 ## Error examples
 
@@ -75,13 +116,24 @@ HTTP/1.1 400 Bad Request
 {"error":"validation_error","message":"'message' is required and must be a non-empty string."}
 ```
 
-Other status codes:
+Unknown job ids are 404:
 
-- `422 invalid_llm_output` - the LLM reply failed validation even after one
-  repair; the raw exchange is quarantined in `logs/quarantine.jsonl`
-- `503 llm_disabled` - the kill switch `LLM_ENABLED=false` is on
-- `503 llm_unavailable` - the LLM provider is down or refuses the request
-- `504 llm_timeout` - the LLM did not answer within the budget (<=60s per call)
+```
+$ curl -i http://127.0.0.1:8000/jobs/triage/does-not-exist
+HTTP/1.1 404 Not Found
+
+{"detail":{"error":"job_not_found","message":"No job with id does-not-exist."}}
+```
+
+Status codes for the job pipeline:
+
+- `202` - accepted; the LLM call runs in the background
+- `400` - validation error with the field named
+- `404` - unknown job id
+- `503` - the worker pool is unavailable (no lifespan / kill switch case
+  surfaces here as job `failed`)
+- `504` - not used at the HTTP layer anymore: a slow LLM fails the JOB, and
+  the job-level retries handle it (see below)
 
 ## The LLM layer (A17)
 
@@ -96,34 +148,43 @@ file `prompts/triage-v1.md`).
 | `LLM_API_KEY`           | `ollama`                   | API key for the provider                            |
 | `LLM_MODEL`             | `qwen3:0.6b`               | Model name                                          |
 | `LLM_STUB`              | `0`                        | `1` = rule-based verdicts, no network (dev/tests)   |
-| `LLM_ENABLED`           | `true`                     | `false` = kill switch, endpoint answers 503         |
+| `LLM_ENABLED`           | `true`                     | `false` = kill switch, jobs fail with llm_disabled  |
 | `LLM_TIMEOUT_SECONDS`   | `60`                       | Max duration of a single LLM call                   |
 | `LLM_MAX_RETRIES`       | `3`                        | Attempts per request                                |
 | `LLM_COST_PER_1K_TOKENS`| `0`                        | Price per 1k tokens for the cost log (0 for Ollama) |
+| `WORKER_COUNT`          | `2`                        | Worker tasks in the pool                            |
+| `JOB_MAX_ATTEMPTS`      | `3`                        | Execution attempts before a job is failed           |
+| `ALERT_WEBHOOK_URL`     | (empty)                    | Optional webhook for job-failed alerts              |
 
 Provider swap = change the three `LLM_*` variables. OpenRouter example:
 `LLM_BASE_URL=https://openrouter.ai/api/v1`, `LLM_API_KEY=sk-or-...`,
 `LLM_MODEL=openrouter/auto`.
 
-### Behaviour contract
+### The background job (BE-06) contract
 
-- Input: `POST /jobs/triage` with `{"message": "..."}` (required, non-empty).
-- Output: `{"verdict": "interested|question|not_a_fit|other", "reasons": [...]}`
-  - the verdict is a Pydantic enum; `reasons` has 1-2 items.
-- The LLM reply is parsed, validated against the schema, and repaired exactly
-  once. If it still fails, the request gets 422 and the exchange is appended
-  to `logs/quarantine.jsonl`.
-- Retry policy: retries happen only on timeout, `429`, and `5xx`, with
-  exponential backoff plus jitter. `400/401/403` are never retried.
-- Every LLM call is appended to `logs/cost.jsonl` (tokens + estimated USD).
-- `LLM_STUB=1` returns deterministic keyword verdicts - no network needed.
-- `LLM_ENABLED=false` makes the endpoint answer `503 llm_disabled`
-  (or the stub fallback when `LLM_STUB=1`).
+- `POST /jobs/triage` with `{"message": "..."}` (required, non-empty; optional
+  `idempotency_key`) answers **202** with `job_id` + `status_url` and a
+  `Location` header. No LLM call happens on the request: the worker pool
+  (started in the app lifespan) picks the job from its queue and runs the
+  triage call off-thread.
+- `GET /jobs/triage/{job_id}` reports `queued` / `running` / `succeeded` /
+  `failed`, plus `attempts`, `result`, and `error`.
+- Job store: append-only `data/jobs.jsonl` (latest line per job wins). After a
+  restart, unfinished jobs are re-enqueued - running twice is safe and
+  idempotent (see "Idempotency").
+- Retries: a failing job is retried up to `JOB_MAX_ATTEMPTS` with exponential
+  backoff + jitter, then marked `failed`.
+- Alerts: every final failure appends a line to `logs/alerts.jsonl` (who/how/
+  when) and, if `ALERT_WEBHOOK_URL` is set, POSTs it there best-effort.
+- Stub and kill switch behaviour moved into the job: with `LLM_STUB=1` jobs
+  succeed with deterministic verdicts; with `LLM_ENABLED=false` jobs fail
+  (error `llm_disabled`), which exercises the retry + alert path.
 
 ## Eval
 
-`evals/cases.json` has 8 labeled cases (2 per category). The runner sends each
-one through the real HTTP path and scores the verdicts:
+`evals/cases.json` has 8 labeled cases (2 per category). The runner submits
+each one as a background job over the real HTTP path (POST -> 202 -> poll the
+status endpoint) and scores the verdicts:
 
 ```
 $ python evals/run.py
@@ -131,10 +192,11 @@ $ python evals/run.py
 ... (8 cases) ...
 
 Eval score: 8/8 (100.0%)
-Total LLM spend: $0.000000 across 23235 tokens (local Ollama, price per 1k = 0)
+Total LLM spend: $0.000000 across 33112 tokens (local Ollama, price per 1k = 0)
 ```
 
-Score computed on 11 Aug 2026 with `qwen3:0.6b` via local Ollama.
+Score computed on 11 Aug 2026 with `qwen3:0.6b` via local Ollama, through the
+BE-06 background pipeline.
 Per-case gold vs predicted detail: `logs/eval-<timestamp>.jsonl`.
 
 ## Swagger UI
@@ -155,21 +217,31 @@ API visually (both the task and the triage endpoints are there).
 +-- src/llm/
 |   +-- clients.py       # OpenAI-compatible client + retry/backoff/jitter policy
 |   +-- service.py       # triage job: stub, parse/validate/repair, quarantine, cost log
-|   +-- schema.py        # LLM output schema (verdict enum + reasons)
+|   +-- schema.py        # LLM output schema (verdict enum + reasons + idempotency_key)
 |   +-- settings.py      # runtime env settings
 |   +-- hello.py         # connectivity check (prints "ready")
++-- src/bg/
+|   +-- store.py         # durable JSONL job store, replayable after restart
+|   +-- worker.py        # queue consumer pool: retries, backoff, in-flight guard
+|   +-- alerts.py        # job-failed alerts (JSONL + optional webhook)
+|   +-- schema.py        # job report / accepted response schemas
+|   +-- settings.py      # WORKER_COUNT, JOB_MAX_ATTEMPTS, ALERT_WEBHOOK_URL
 +-- prompts/
 |   +-- triage-v1.md     # versioned prompt file for the job
 +-- evals/
 |   +-- cases.json       # 8 labeled eval cases
-|   +-- run.py           # eval runner (scores over the real endpoint)
+|   +-- run.py           # eval runner (submits jobs, polls, scores)
 +-- tests/
 |   +-- test_tasks.py    # CRUD + error paths
-|   +-- test_llm.py      # validation, stub verdicts, schema shape, kill switch
+|   +-- test_llm.py      # validation, stub verdicts, schema shape, kill switch + alerts
+|   +-- test_bg.py       # 202/Location, status flow, idempotency, 404
 +-- JOB-CARD.md
 +-- .env.example
 +-- requirements.txt
 ```
+
+Runtime data is git-ignored: `logs/` (cost, quarantine, alerts, eval details)
+and `data/` (the job log).
 
 ## Tests
 
@@ -177,7 +249,8 @@ API visually (both the task and the triage endpoints are there).
 pytest -v
 ```
 
-23 tests: root endpoint, health check, full CRUD flow, missing/empty
+28 tests: root endpoint, health check, full CRUD flow, missing/empty
 title/message (400 naming the field), not-found errors (404), correct status
-codes, stub-mode verdicts for all four categories, schema shape, and the kill
-switch.
+codes, stub-mode verdicts for all four categories, schema shape, the kill
+switch with alert verification, and the background contract (202 + Location,
+queued -> running -> succeeded, idempotency keys, unknown job 404).
