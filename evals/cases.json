@@ -1,0 +1,50 @@
+[
+  {
+    "id": "interested-1",
+    "category": "interested",
+    "message": "hi! I am a data analyst with 4 years of experience and I would like to apply for the open position. Should I email my CV or fill in the form?",
+    "expected": "interested"
+  },
+  {
+    "id": "interested-2",
+    "category": "interested",
+    "message": "I am really interested in the marketing intern role. Where do I submit my application and what documents do you need?",
+    "expected": "interested"
+  },
+  {
+    "id": "question-1",
+    "category": "question",
+    "message": "Hi, is the data analyst role remote? Do you have flexible working hours?",
+    "expected": "question"
+  },
+  {
+    "id": "question-2",
+    "category": "question",
+    "message": "Could you tell me the salary range for this position and how long the recruitment process usually takes?",
+    "expected": "question"
+  },
+  {
+    "id": "not-a-fit-1",
+    "category": "not_a_fit",
+    "message": "We boost your Google ranking with guaranteed backlinks in 30 days. DM us for our SEO packages and pricing.",
+    "expected": "not_a_fit"
+  },
+  {
+    "id": "not-a-fit-2",
+    "category": "not_a_fit",
+    "message": "Hello, I am an insurance agent and I would like to speak to whoever handles employee benefits. I have great group plans.",
+    "expected": "not_a_fit"
+  },
+  {
+    "id": "other-1",
+    "category": "other",
+    "message": "Heads up: the parking garage entrance will be closed tomorrow for maintenance. Please use the street entrance.",
+    "expected": "other"
+  },
+  {
+    "id": "other-2",
+    "category": "other",
+    "message": "Good morning, the invoice from last quarter was paid. Here is the payment reference number for your records.",
+    "expected": "other"
+  }
+]
