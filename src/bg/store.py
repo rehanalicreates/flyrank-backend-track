@@ -57,11 +57,22 @@ class JobStore:
 
     # -- job lifecycle -----------------------------------------------------
 
-    def create(self, job_id: str, message: str, idempotency_key: Optional[str] = None) -> dict:
+    def create(
+        self,
+        job_id: str,
+        message: str,
+        idempotency_key: Optional[str] = None,
+        kind: str = "triage",
+        payload: Optional[dict] = None,
+    ) -> dict:
+        """Create a queued job. kind routes execution (worker dispatch):
+        "triage" runs the LLM call, "report" renders a PDF (week 7)."""
         record = {
             "job_id": job_id,
             "idempotency_key": idempotency_key,
             "message": message,
+            "kind": kind,
+            "payload": payload,
             "status": "queued",
             "attempts": 0,
             "result": None,
@@ -75,9 +86,11 @@ class JobStore:
     def get(self, job_id: str) -> Optional[dict]:
         return self.jobs.get(job_id)
 
-    def find_by_idempotency_key(self, key: str) -> Optional[dict]:
+    def find_by_idempotency_key(self, key: str, kind: Optional[str] = None) -> Optional[dict]:
         for job in self.jobs.values():
-            if job.get("idempotency_key") == key:
+            if job.get("idempotency_key") == key and (
+                kind is None or job.get("kind", "triage") == kind
+            ):
                 return job
         return None
 

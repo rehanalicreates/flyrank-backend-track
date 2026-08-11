@@ -1,18 +1,24 @@
-# Task API with LLM triage
+# Task API with LLM triage and PDF reports
 
-Week 2 (BE-01, CRUD Task API) plus A17 (`Put an LLM behind your API`) and
-BE-06 (`Your first background job`) for the **Backend AI Engineering** track
-at FlyRank.
+Week 2 (BE-01, CRUD Task API) plus A17 (`Put an LLM behind your API`),
+BE-06 (`Your first background job`), and the week 7 PDF report generator
+for the **Backend AI Engineering** track at FlyRank.
 
-Three things live in this repo:
+Four things live in this repo:
 
-1. A CRUD API that manages a to-do list: create, read, update, delete tasks.
+1. A CRUD API that manages a to-do list: create, read, update, delete tasks
+   (SQLite-backed since week 7, so reports aggregate real SQL).
 2. An LLM-powered triage job (`/jobs/triage`): classifies a candidate message
    into one of four closed categories, with clean error handling, timeouts,
    retries, a stub mode, a kill switch, and a per-call cost log (A17).
 3. The same job executed as a **background job** (BE-06): `POST` answers 202
    instantly, a worker pool does the LLM call, `GET /jobs/triage/{id}` reports
    status and result. Idempotency, retries, and alerts are built in.
+4. **PDF report generation** (week 7, `JOB-CARD-reports.md`): `POST /reports`
+   answers 202, a worker runs SQL aggregation over the task database and
+   renders a PDF artifact into `data/reports/`; the job result carries only a
+   link (`GET /reports/{id}` -> `GET /reports/{id}/download` streams the
+   file). A scheduler fires the report daily at `REPORT_DAILY_TIME` (stretch).
 
 ## Stack
 
@@ -20,7 +26,9 @@ Three things live in this repo:
 - **Pydantic v2** - request/response validation
 - **openai + python-dotenv** - LLM client glue; works with Ollama locally or
   any OpenAI-compatible provider
-- **pytest + httpx** - test suite (28 tests)
+- **sqlite3** (stdlib) - task storage and the report's SQL aggregation
+- **reportlab** - PDF rendering (Platypus)
+- **pytest + httpx** - test suite (42 tests)
 
 ## Run it
 
@@ -46,6 +54,10 @@ Interactive docs (Swagger UI): http://127.0.0.1:8000/docs
 | DELETE | `/tasks/{id}`          | 204 No Content, 404 Not Found                         |
 | POST   | `/jobs/triage`         | 202 Accepted, 400 Bad Request (LLM runs in background)|
 | GET    | `/jobs/triage/{id}`    | 200 OK, 404 Not Found                                 |
+| POST   | `/reports`             | 202 Accepted (PDF renders in background)              |
+| GET    | `/reports/{id}`        | 200 OK, 404 Not Found (status + artifact link)        |
+| GET    | `/reports/{id}/download`| 200 OK PDF, 404, 409 if not succeeded yet            |
+| GET    | `/reports/schedule`    | 200 OK (daily scheduler state)                        |
 
 ## curl example: create a task
 
@@ -85,6 +97,48 @@ Statuses: `queued` -> `running` -> `succeeded` (result present) or `failed`
 
 Windows cmd note: single quotes do not work in cmd; use
 `-d "{\"message\":\"...\"}"` there.
+
+## The PDF report (week 7)
+
+`JOB-CARD-reports.md` is the one-page job brief. The pipeline:
+
+1. **Query** - the worker runs SQL aggregation over `data/tasks.db`
+   (`src/reports/queries.py`): totals, status breakdown, tasks created per
+   day (last 14), tasks by hour, recent tasks.
+2. **Render** - `src/reports/render.py` turns the stats into a PDF with
+   ReportLab (summary grid, tables, footer with job id and timestamp).
+3. **Artifact** - the PDF is written to `data/reports/{job_id}.pdf` once and
+   the job result carries only metadata: `file_name`, `size_bytes`,
+   `download_url`. No bytes travel in JSON (store and link, not 20 MB).
+
+```
+$ curl -i -X POST http://127.0.0.1:8000/reports -H "Content-Type: application/json" \
+    -d '{"report_type": "tasks"}'
+HTTP/1.1 202 Accepted
+location: /reports/report_fe1d908ccb71
+{"job_id":"report_fe1d908ccb71","status":"queued","status_url":"/reports/report_fe1d908ccb71"}
+```
+
+```
+$ curl http://127.0.0.1:8000/reports/report_fe1d908ccb71
+{"job_id":"report_fe1d908ccb71","status":"succeeded","attempts":1,
+ "artifact":{"file_name":"report_fe1d908ccb71.pdf","size_bytes":4513,
+             "download_url":"/reports/report_fe1d908ccb71/download","report_type":"tasks"},
+ "summary":{"total_tasks":14,"completed":10,"open":4,"completion_rate":71.4,...}}
+```
+
+```
+$ curl -o sample-report.pdf http://127.0.0.1:8000/reports/report_fe1d908ccb71/download
+HTTP/1.1 200 OK   (content-type: application/pdf, content-length: 4513)
+```
+
+Same contract as triage: idempotency key dedupe, `queued`/`running`/
+`succeeded`/`failed`, retries with backoff, alerts on final failure. The
+download endpoint answers 409 `report_not_ready` until the job succeeds and
+validates the job id before touching the filesystem. The scheduler (stretch)
+fires the daily report at `REPORT_DAILY_TIME` (UTC) through the same
+pipeline, persisted in `data/schedules.jsonl` so a restart never fires
+twice: `GET /reports/schedule` shows its state.
 
 ## Idempotency (BE-06: "jobs will run twice")
 
@@ -155,6 +209,9 @@ file `prompts/triage-v1.md`).
 | `WORKER_COUNT`          | `2`                        | Worker tasks in the pool                            |
 | `JOB_MAX_ATTEMPTS`      | `3`                        | Execution attempts before a job is failed           |
 | `ALERT_WEBHOOK_URL`     | (empty)                    | Optional webhook for job-failed alerts              |
+| `REPORTS_DIR`           | `data/reports`             | Where generated PDFs live (artifacts)               |
+| `REPORT_DAILY_TIME`     | `18:00`                    | Daily auto-report fire time, UTC (scheduler)        |
+| `REPORT_SCHEDULE_CHECK_SECONDS` | `30`              | Scheduler wake-up interval                           |
 
 Provider swap = change the three `LLM_*` variables. OpenRouter example:
 `LLM_BASE_URL=https://openrouter.ai/api/v1`, `LLM_API_KEY=sk-or-...`,
@@ -212,7 +269,7 @@ API visually (both the task and the triage endpoints are there).
 +-- app/
 |   +-- main.py          # FastAPI app, routes, error handlers
 |   +-- models.py        # Pydantic schemas (task request/response shapes)
-|   +-- repository.py    # In-memory data layer
+|   +-- repository.py    # SQLite task store (same CRUD interface as before)
 |   +-- exceptions.py    # Domain exceptions (framework-agnostic)
 +-- src/llm/
 |   +-- clients.py       # OpenAI-compatible client + retry/backoff/jitter policy
@@ -226,6 +283,14 @@ API visually (both the task and the triage endpoints are there).
 |   +-- alerts.py        # job-failed alerts (JSONL + optional webhook)
 |   +-- schema.py        # job report / accepted response schemas
 |   +-- settings.py      # WORKER_COUNT, JOB_MAX_ATTEMPTS, ALERT_WEBHOOK_URL
++-- src/reports/
+|   +-- queries.py       # SQL aggregation over data/tasks.db (read-only)
+|   +-- render.py        # ReportLab PDF rendering (Platypus tables)
+|   +-- job.py           # the report job: query + render + artifact metadata
+|   +-- artifacts.py     # safe artifact path resolution (job id validation)
+|   +-- scheduler.py     # daily fire loop (stretch), schedules.jsonl
+|   +-- schema.py        # report request / accepted / response schemas
+|   +-- settings.py      # REPORTS_DIR, REPORT_DAILY_TIME, check seconds
 +-- prompts/
 |   +-- triage-v1.md     # versioned prompt file for the job
 +-- evals/
@@ -235,7 +300,9 @@ API visually (both the task and the triage endpoints are there).
 |   +-- test_tasks.py    # CRUD + error paths
 |   +-- test_llm.py      # validation, stub verdicts, schema shape, kill switch + alerts
 |   +-- test_bg.py       # 202/Location, status flow, idempotency, 404
+|   +-- test_reports.py  # report flow, artifact link, PDF download, aggregation math, scheduler
 +-- JOB-CARD.md
++-- JOB-CARD-reports.md
 +-- .env.example
 +-- requirements.txt
 ```
@@ -249,8 +316,12 @@ and `data/` (the job log).
 pytest -v
 ```
 
-28 tests: root endpoint, health check, full CRUD flow, missing/empty
+42 tests: root endpoint, health check, full CRUD flow, missing/empty
 title/message (400 naming the field), not-found errors (404), correct status
 codes, stub-mode verdicts for all four categories, schema shape, the kill
-switch with alert verification, and the background contract (202 + Location,
-queued -> running -> succeeded, idempotency keys, unknown job 404).
+switch with alert verification, the background contract (202 + Location,
+queued -> running -> succeeded, idempotency keys, unknown job 404), and the
+report generator (202 + Location, artifact metadata instead of bytes, PDF
+download, 409 before success, unknown/foreign job 404, idempotency,
+schedule endpoint, exact SQL aggregation math, PDF render on empty and
+populated data, scheduler due math and no double fire).

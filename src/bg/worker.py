@@ -88,10 +88,23 @@ class JobWorker:
 
         self.store.touch(job_id, status="running", attempts=job["attempts"] + 1)
         try:
-            client = LLMClient(cfg=get_settings())
-            result = await asyncio.to_thread(triage_message, job["message"], client)
-            self.store.touch(job_id, status="succeeded", result=result.model_dump(), error=None)
-        except Exception as exc:  # noqa: BLE001 - every LLM failure is retryable at job level
+            kind = job.get("kind", "triage")
+            if kind == "report":
+                # Week 7: the PDF report job. SQL aggregation + rendering are
+                # blocking, so they run off-thread like the LLM call. The
+                # result is artifact metadata, never PDF bytes.
+                from src.reports.job import run_report_job
+                from src.reports.settings import get_report_settings
+
+                reports_dir = get_report_settings()["reports_dir"]
+                result = await asyncio.to_thread(
+                    run_report_job, job_id, job.get("payload") or {}, reports_dir
+                )
+            else:
+                client = LLMClient(cfg=get_settings())
+                result = (await asyncio.to_thread(triage_message, job["message"], client)).model_dump()
+            self.store.touch(job_id, status="succeeded", result=result, error=None)
+        except Exception as exc:  # noqa: BLE001 - every job failure is retryable at job level
             attempts = self.store.get(job_id)["attempts"]
             if attempts >= max_attempts:
                 self.store.touch(job_id, status="failed", error=str(exc)[:500])

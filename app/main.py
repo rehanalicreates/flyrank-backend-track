@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.requests import Request
 from dotenv import load_dotenv
 
@@ -35,6 +35,10 @@ from src.bg.worker import JobWorker
 from src.llm.clients import LLMDisabled, LLMTimeout, LLMUnavailable
 from src.llm.schema import TriageRequest
 from src.llm.service import LLMInvalidOutput
+from src.reports.artifacts import artifact_path
+from src.reports.scheduler import ReportScheduler
+from src.reports.schema import ReportAccepted, ReportRequest, ReportResponse
+from src.reports.settings import get_report_settings
 
 load_dotenv()
 
@@ -61,14 +65,22 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.run())
         for _ in range(worker.cfg["worker_count"])
     ]
+
+    # Week 7 stretch: the daily report scheduler (fires an ordinary report
+    # job through the same worker pool when the clock passes the daily time).
+    scheduler = ReportScheduler(bg_store, worker, cfg=get_report_settings())
+    app.state.report_scheduler = scheduler
+    schedule_task = asyncio.create_task(scheduler.run())
+
     yield
+    schedule_task.cancel()
     for task in tasks:
         task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(schedule_task, *tasks, return_exceptions=True)
 
 app = FastAPI(
     title="FlyRank Task API",
-    description="Week 1 Backend AI Engineering assignment - a CRUD Task API with an LLM triage job (A17) executed on a background worker (BE-06).",
+    description="Backend AI Engineering track - a CRUD Task API, an LLM triage job (A17) on a background worker (BE-06), and PDF report generation on the same job pattern (week 7).",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -165,7 +177,7 @@ async def llm_invalid_output_handler(request: Request, exc: LLMInvalidOutput):
 
 @app.get("/", tags=["meta"])
 def root():
-    return {"name": "Task API", "version": "1.0", "endpoints": ["/tasks"]}
+    return {"name": "Task API", "version": "1.0", "endpoints": ["/tasks", "/jobs/triage", "/reports"]}
 
 
 @app.get("/health", tags=["meta"])
@@ -241,7 +253,7 @@ def create_triage_job(payload: TriageRequest, request: Request, response: Respon
     creating a duplicate (idempotency). Input validation still returns 400
     naming the field."""
     if payload.idempotency_key:
-        existing = bg_store.find_by_idempotency_key(payload.idempotency_key)
+        existing = bg_store.find_by_idempotency_key(payload.idempotency_key, kind="triage")
         if existing is not None:
             job_id = existing["job_id"]
             accepted = JobAccepted(
@@ -270,3 +282,126 @@ def get_triage_job(job_id: str) -> JobResponse:
             detail={"error": "job_not_found", "message": f"No job with id {job_id}."},
         )
     return JobResponse(**job)
+
+
+# ---------------------------------------------------------------------------
+# Week 7: the PDF report feature (background job, artifact handling)
+# ---------------------------------------------------------------------------
+
+def _report_not_found(job_id: str):
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"error": "job_not_found", "message": f"No report job with id {job_id}."},
+    )
+
+
+def _report_accepted(job: dict) -> ReportAccepted:
+    return ReportAccepted(
+        job_id=job["job_id"],
+        status=job["status"],
+        status_url=f"/reports/{job['job_id']}",
+    )
+
+
+@app.post(
+    "/reports",
+    response_model=ReportAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["reports"],
+)
+def create_report_job(
+    payload: ReportRequest, request: Request, response: Response
+) -> ReportAccepted:
+    """Generate a PDF report in the background (week 7).
+
+    Answers 202 immediately with a job id; the worker queries the task
+    database with SQL, renders the PDF into data/reports/, and stores artifact
+    metadata (file name, size, download URL) as the job result. Poll
+    GET /reports/{job_id} for the link, then GET /reports/{job_id}/download
+    for the file. A repeated idempotency_key returns the SAME job.
+    """
+    if payload.idempotency_key:
+        existing = bg_store.find_by_idempotency_key(payload.idempotency_key, kind="report")
+        if existing is not None:
+            accepted = _report_accepted(existing)
+            response.headers["Location"] = accepted.status_url
+            return accepted
+
+    job_id = f"report_{uuid.uuid4().hex[:12]}"
+    bg_store.create(
+        job_id,
+        None,
+        payload.idempotency_key,
+        kind="report",
+        payload={"report_type": payload.report_type},
+    )
+    _bg_worker(request).enqueue(job_id)
+    accepted = _report_accepted(bg_store.get(job_id))
+    response.headers["Location"] = accepted.status_url
+    return accepted
+
+
+@app.get("/reports/schedule", tags=["reports"])
+def report_schedule(request: Request) -> dict:
+    """Scheduler state: daily fire time, next run, recent fires (stretch)."""
+    scheduler = getattr(request.app.state, "report_scheduler", None)
+    if scheduler is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "scheduler_unavailable", "message": "Scheduler is not running."},
+        )
+    return scheduler.snapshot()
+
+
+@app.get("/reports/{job_id}", response_model=ReportResponse, tags=["reports"])
+def get_report_job(job_id: str) -> ReportResponse:
+    """Status + artifact link of one report job. 404 if unknown."""
+    job = bg_store.get(job_id)
+    if job is None or job.get("kind", "triage") != "report":
+        _report_not_found(job_id)
+    result = job.get("result") or {}
+    job_payload = job.get("payload") or {}
+    return ReportResponse(
+        job_id=job["job_id"],
+        idempotency_key=job.get("idempotency_key"),
+        status=job["status"],
+        attempts=job["attempts"],
+        report_type=job_payload.get("report_type", "tasks"),
+        artifact=result.get("artifact"),
+        summary=result.get("summary"),
+        error=job.get("error"),
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+    )
+
+
+@app.get("/reports/{job_id}/download", tags=["reports"])
+def download_report(job_id: str):
+    """Stream the PDF artifact. 404 if the job is unknown, 409 if the job has
+    not succeeded yet (no artifact exists until then)."""
+    job = bg_store.get(job_id)
+    if job is None or job.get("kind", "triage") != "report":
+        _report_not_found(job_id)
+    if job["status"] != "succeeded":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "report_not_ready",
+                "message": f"Report is {job['status']}; the PDF exists only after the job succeeds.",
+            },
+        )
+    try:
+        path = artifact_path(get_report_settings()["reports_dir"], job_id)
+    except ValueError:
+        _report_not_found(job_id)
+    if not path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "artifact_missing", "message": "The PDF file is missing on disk."},
+        )
+    return FileResponse(path, media_type="application/pdf", filename=path.name)
+
+
+# ---------------------------------------------------------------------------
+# Week 7: the PDF report feature (background job, artifact handling)
+# ---------------------------------------------------------------------------
